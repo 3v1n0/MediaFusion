@@ -4,13 +4,10 @@ set -e
 
 profilePath="${PROFILE_PATH:-/config}"
 downloadsPath="${DOWNLOADS_PATH:-/downloads}"
-qbtConfigFile="$profilePath/qBittorrent/config/qBittorrent.conf"
 htpasswdPath="/etc/apache2/.htpasswd"
 webdavConf="/etc/apache2/conf.d/010-webdav.conf"
 
-# Ensure the configuration and download directories exist, this has to happen
-# before the chown below or the config subdirectory stays root owned
-mkdir -p "$profilePath" "$(dirname "$qbtConfigFile")" "$downloadsPath"
+mkdir -p "$profilePath" "$downloadsPath"
 
 # httpd refuses to start with "httpd (pid N) already running" when a pid file
 # survived a kill, drop the leftovers before handing over to supervisord
@@ -20,20 +17,6 @@ rm -f /run/apache2/httpd.pid /run/supervisord.pid
 # like the upstream entrypoint does
 chown qbtUser:qbtUser "$downloadsPath"
 chown -R qbtUser:qbtUser "$profilePath" /var/log/apache2 /run/apache2
-
-# Custom logic to handle qBittorrent configuration setup
-if [ ! -f "$qbtConfigFile" ]; then
-    echo "Creating qBittorrent configuration file at $qbtConfigFile"
-    cat << EOF > "$qbtConfigFile"
-[BitTorrent]
-Session\DefaultSavePath=$downloadsPath
-Session\Port=6881
-Session\TempPath=$downloadsPath/temp
-
-[LegalNotice]
-Accepted=true
-EOF
-fi
 
 # write the WebDAV access rules from scratch on every start, editing the vhost
 # in place would stack up duplicate directives on each restart
@@ -65,4 +48,5 @@ Alias /webdav $downloadsPath
 EOF
 fi
 
+# qBittorrent itself is started by the upstream entrypoint, see supervisord.conf
 exec /usr/bin/supervisord -c /etc/supervisord.conf
