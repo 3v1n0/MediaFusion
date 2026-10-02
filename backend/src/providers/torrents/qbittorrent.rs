@@ -4,6 +4,7 @@
 /// the selected file via credentialed WebDAV URL.
 use std::time::{Duration, Instant};
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::{
     Client,
     header::{COOKIE, HeaderMap, SET_COOKIE},
@@ -158,6 +159,53 @@ async fn qb_login(http: &Client, cfg: &QbConfig) -> Result<String, ProviderError
             "qbittorrent_error.mp4",
         )
     })
+}
+
+/// One file as qBittorrent knows it: `name` is relative to the torrent's save
+/// path and therefore carries the full in-torrent path.
+#[derive(Debug, Clone, PartialEq)]
+struct QbFile {
+    index: usize,
+    name: String,
+    size: i64,
+}
+
+/// Per-file metadata straight from qBittorrent.
+///
+/// Without this the WebDAV walk is the only source, and it cannot report a
+/// size or a stable file index, so selection degenerates: the "largest video"
+/// tie-break compares zeros and two files sharing a basename are
+/// indistinguishable.
+async fn qb_torrent_files(
+    http: &Client,
+    cfg: &QbConfig,
+    session_cookie: &str,
+    info_hash: &str,
+) -> Result<Vec<QbFile>, ProviderError> {
+    let url = format!("{}/api/v2/torrents/files?hash={info_hash}", cfg.qb_url);
+    let arr: Vec<Value> = http
+        .get(&url)
+        .header(COOKIE, session_cookie)
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(arr
+        .iter()
+        .filter_map(|v| {
+            let name = v.get("name").and_then(|n| n.as_str())?;
+            // `index` only exists since API v2.8.2; fall back to array order.
+            let index = v
+                .get("index")
+                .and_then(|i| i.as_i64())
+                .map_or_else(|| usize::MAX, |i| i.max(0) as usize);
+            Some(QbFile {
+                index,
+                name: name.replace('\\', "/"),
+                size: v.get("size").and_then(|s| s.as_i64()).unwrap_or(0),
+            })
+        })
+        .collect())
 }
 
 async fn qb_torrent_info(
@@ -411,15 +459,98 @@ fn classify_href<'a>(href: &'a str, dir: &str) -> Option<Href<'a>> {
     })
 }
 
+/// Characters that must not appear literally in a URL path segment. The
+/// sub-delims and `:`/`@` are legal there, so unlike the userinfo set only the
+/// genuinely structural ones are escaped.
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'[')
+    .add(b']');
+
+/// Percent-encode each `/`-separated segment of a server-side file path.
+///
+/// qBittorrent reports names as they sit on disk (`Some.Release/Ben The Men.mkv`)
+/// while a WebDAV href is percent-encoded, so the path has to be encoded before
+/// it can go into a streaming URL.
+fn encode_path_segments(path: &str) -> String {
+    path.split('/')
+        .map(|seg| utf8_percent_encode(seg, PATH_SEGMENT).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Resolve the WebDAV href of one of a torrent's files.
+///
+/// `wdp` is the configured downloads path, so the result stays relative to the
+/// WebDAV root and composes with `webdav_url` the same way a listed href does.
+fn torrent_file_href(wdp: &str, info_hash: &str, relative_name: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        wdp.trim_matches('/'),
+        info_hash,
+        encode_path_segments(relative_name.trim_start_matches('/'))
+    )
+    .trim_start_matches('/')
+    .to_string()
+}
+
 async fn find_file(
     http: &Client,
     cfg: &QbConfig,
+    session_cookie: &str,
     info_hash: &str,
     torrent_name: &str,
     filename: Option<&str>,
     season: Option<i32>,
     episode: Option<i32>,
 ) -> Result<String, ProviderError> {
+    // qBittorrent already knows every file of the torrent: relative path, size
+    // and index. Selecting from that list needs no directory walking at all,
+    // and two files sharing a basename in different directories stay distinct
+    // because the whole relative path is what we match and build the URL from.
+    let qb_files = qb_torrent_files(http, cfg, session_cookie, info_hash)
+        .await
+        .unwrap_or_default();
+    if !qb_files.is_empty() {
+        let files: Vec<FileEntry> = qb_files
+            .iter()
+            .map(|f| FileEntry {
+                index: f.index,
+                name: f.name.clone(),
+                size: f.size,
+            })
+            .collect();
+        if let Ok(idx) =
+            select_torrent_file_index(&files, torrent_name, filename, season, episode, None, None)
+        {
+            for root in &cfg.downloads_paths {
+                let href = torrent_file_href(root, info_hash, &files[idx].name);
+                if webdav::exists(
+                    http,
+                    &cfg.webdav_url,
+                    &href,
+                    &cfg.webdav_user,
+                    &cfg.webdav_pass,
+                )
+                .await
+                {
+                    return Ok(href);
+                }
+            }
+        }
+    }
+
+    // Fallback for when qBittorrent does not know the hash: discover the layout
+    // by walking the WebDAV tree instead.
     for root in &cfg.downloads_paths {
         let path = format!("{}/{}", root.trim_end_matches('/'), info_hash);
         let files = list_webdav_files_recursive(http, cfg, &path).await?;
@@ -486,6 +617,7 @@ pub async fn get_video_url(
     let file_path = match find_file(
         http,
         &cfg,
+        &session_cookie,
         info_hash,
         torrent_name,
         filename,
@@ -501,6 +633,7 @@ pub async fn get_video_url(
             find_file(
                 http,
                 &cfg,
+                &session_cookie,
                 info_hash,
                 torrent_name,
                 filename,
@@ -615,7 +748,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS, Href, classify_href, parse_config, session_cookie,
+        DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS, Href, QbFile, classify_href, encode_path_segments,
+        parse_config, session_cookie, torrent_file_href,
     };
 
     #[test]
@@ -716,7 +850,37 @@ mod tests {
     }
 
     #[test]
-    fn extracts_qbittorrent_sid_cookie() {
+    fn torrent_file_href_builds_an_encoded_webdav_path() {
+        // qBittorrent names are raw on-disk paths; a WebDAV href is encoded.
+        assert_eq!(
+            torrent_file_href("/", "abc123", "movie.mkv"),
+            "abc123/movie.mkv"
+        );
+        assert_eq!(
+            torrent_file_href("/", "abc123", "Show.S01/The.End[Ben The Men].mkv"),
+            "abc123/Show.S01/The.End%5BBen%20The%20Men%5D.mkv"
+        );
+        // A configured subdirectory is kept, without a leading slash so it
+        // composes with webdav_url the same way a listed href does.
+        assert_eq!(
+            torrent_file_href("/downloads", "abc123", "Sub/movie.mkv"),
+            "downloads/abc123/Sub/movie.mkv"
+        );
+    }
+
+    #[test]
+    fn encode_path_segments_keeps_separators_and_sub_delims() {
+        assert_eq!(
+            encode_path_segments("Show.S01/Ben The Men.mkv"),
+            "Show.S01/Ben%20The%20Men.mkv"
+        );
+        // A literal percent must not be able to smuggle an escape sequence in.
+        assert_eq!(encode_path_segments("100%25.mkv"), "100%2525.mkv");
+        assert_eq!(encode_path_segments("a+b,c;d=e@f.mkv"), "a+b,c;d=e@f.mkv");
+    }
+
+    #[test]
+    fn extract_qbittorrent_sid_cookie() {
         let mut headers = HeaderMap::new();
         headers.append(SET_COOKIE, HeaderValue::from_static("theme=dark; Path=/"));
         headers.append(
