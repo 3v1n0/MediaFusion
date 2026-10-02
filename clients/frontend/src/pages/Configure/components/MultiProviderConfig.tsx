@@ -871,6 +871,26 @@ function SingleProviderEditor({
                   </div>
 
                   <div className="space-y-2">
+                    <Label>Play video after download (%)</Label>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={100}
+                      value={provider.qbc?.pva ?? 100}
+                      onChange={(e) =>
+                        updateQBConfig({
+                          pva: Math.min(100, Math.max(0, Number(e.target.value) || 0)),
+                        })
+                      }
+                      placeholder="100"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Percentage downloaded before playback starts. The default of 100 waits for the torrent to finish;
+                      lower values start earlier and play while the rest is still downloading.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
                     <Label>WebDAV downloads path</Label>
                     <Input
                       value={provider.qbc?.wdp ?? '/'}
