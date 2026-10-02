@@ -2,7 +2,7 @@
 ///
 /// Adds magnet/torrent to qBittorrent, waits for download progress, then serves
 /// the selected file via credentialed WebDAV URL.
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::{
     Client,
@@ -16,6 +16,9 @@ use crate::providers::{
     usenet::webdav,
 };
 
+/// Keeps the previous 60 x 5s behaviour for profiles that never set one.
+const DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS: i64 = 300;
+
 #[derive(Debug, Clone)]
 struct QbConfig {
     qb_url: String,
@@ -26,6 +29,8 @@ struct QbConfig {
     webdav_pass: String,
     downloads_paths: Vec<String>,
     play_video_after: i32,
+    /// How long to wait for a torrent to reach `play_video_after`, in seconds.
+    download_wait_timeout_secs: u64,
     seeding_time_limit: i32,
     seeding_ratio_limit: f64,
     category: String,
@@ -72,7 +77,14 @@ fn parse_config(raw: &Value) -> Result<QbConfig, ProviderError> {
         .get("play_video_after")
         .or_else(|| raw.get("pva"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(100) as i32;
+        .unwrap_or(100)
+        .clamp(0, 100) as i32;
+    let download_wait_timeout_secs = raw
+        .get("download_wait_timeout")
+        .or_else(|| raw.get("dwt"))
+        .and_then(|v| v.as_i64())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS) as u64;
     let seeding_time_limit = raw
         .get("seeding_time_limit")
         .or_else(|| raw.get("stl"))
@@ -94,6 +106,7 @@ fn parse_config(raw: &Value) -> Result<QbConfig, ProviderError> {
         webdav_pass,
         downloads_paths,
         play_video_after,
+        download_wait_timeout_secs,
         seeding_time_limit,
         seeding_ratio_limit,
         category,
@@ -294,18 +307,35 @@ async fn wait_for_progress(
     info_hash: &str,
 ) -> Result<(), ProviderError> {
     let threshold = cfg.play_video_after as f64 / 100.0;
-    for _ in 0..60 {
-        if let Some(progress) = qb_torrent_info(http, cfg, session_cookie, info_hash).await?
-            && progress >= threshold
-        {
-            return Ok(());
+    let deadline = Instant::now() + Duration::from_secs(cfg.download_wait_timeout_secs);
+    let mut last_progress: Option<f64> = None;
+
+    loop {
+        if let Some(progress) = qb_torrent_info(http, cfg, session_cookie, info_hash).await? {
+            last_progress = Some(progress);
+            if progress >= threshold {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            let pct = last_progress.map_or(0.0, |p| p * 100.0);
+            tracing::debug!(
+                info_hash = %info_hash,
+                progress_pct = %pct,
+                target_pct = cfg.play_video_after,
+                waited_secs = cfg.download_wait_timeout_secs,
+                "qBittorrent download wait timed out"
+            );
+            return Err(ProviderError::api(
+                format!(
+                    "Torrent at {pct:.1}% after {}s, still below the configured {}% — retry once it downloads further",
+                    cfg.download_wait_timeout_secs, cfg.play_video_after
+                ),
+                "torrent_not_downloaded.mp4",
+            ));
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    Err(ProviderError::api(
-        "Torrent not downloaded yet",
-        "torrent_not_downloaded.mp4",
-    ))
 }
 
 async fn list_webdav_files_recursive(
@@ -549,8 +579,68 @@ pub async fn update_cache_status(
 #[cfg(test)]
 mod tests {
     use reqwest::header::{HeaderMap, HeaderValue, SET_COOKIE};
+    use serde_json::json;
 
-    use super::session_cookie;
+    use super::{DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS, parse_config, session_cookie};
+
+    #[test]
+    fn download_wait_timeout_defaults_to_five_minutes() {
+        let cfg = parse_config(&json!({
+            "qbittorrent_url": "http://qb:8080",
+            "webdav_url": "http://dav/webdav",
+        }))
+        .unwrap();
+
+        assert_eq!(
+            cfg.download_wait_timeout_secs as i64,
+            DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn download_wait_timeout_is_read_from_both_spellings() {
+        for key in ["download_wait_timeout", "dwt"] {
+            let cfg = parse_config(&json!({
+                "qbittorrent_url": "http://qb:8080",
+                "webdav_url": "http://dav/webdav",
+                key: 1800,
+            }))
+            .unwrap();
+
+            assert_eq!(cfg.download_wait_timeout_secs, 1800, "{key}");
+        }
+    }
+
+    #[test]
+    fn non_positive_download_wait_timeout_falls_back_to_the_default() {
+        for value in [json!(0), json!(-5)] {
+            let cfg = parse_config(&json!({
+                "qbittorrent_url": "http://qb:8080",
+                "webdav_url": "http://dav/webdav",
+                "dwt": value,
+            }))
+            .unwrap();
+
+            assert_eq!(
+                cfg.download_wait_timeout_secs as i64,
+                DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS
+            );
+        }
+    }
+
+    #[test]
+    fn play_video_after_is_clamped_to_a_percentage() {
+        for (raw, expected) in [(json!(-10), 0), (json!(30), 30), (json!(250), 100)] {
+            let cfg = parse_config(&json!({
+                "qbittorrent_url": "http://qb:8080",
+                "webdav_url": "http://dav/webdav",
+                "pva": raw,
+            }))
+            .unwrap();
+
+            assert_eq!(cfg.play_video_after, expected, "{raw}");
+        }
+    }
 
     #[test]
     fn extracts_qbittorrent_sid_cookie() {

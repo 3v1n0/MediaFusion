@@ -175,6 +175,7 @@ function SingleProviderEditor({
       stl: 1440,
       srl: 1.0,
       pva: 100,
+      dwt: 300,
       cat: 'MediaFusion',
       wur: '',
       wus: '',
@@ -887,6 +888,26 @@ function SingleProviderEditor({
                     <p className="text-xs text-muted-foreground">
                       Percentage downloaded before playback starts. The default of 100 waits for the torrent to finish;
                       lower values start earlier and play while the rest is still downloading.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>Download wait timeout (seconds)</Label>
+                    <Input
+                      type="number"
+                      min={30}
+                      max={86400}
+                      value={provider.qbc?.dwt ?? 300}
+                      onChange={(e) =>
+                        updateQBConfig({
+                          dwt: Math.min(86400, Math.max(30, Number(e.target.value) || 300)),
+                        })
+                      }
+                      placeholder="300"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      How long to wait for the percentage above before giving up. Raise it for large or slow torrents,
+                      since the wait ends in an error rather than a slow start.
                     </p>
                   </div>
 

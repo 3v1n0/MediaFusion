@@ -12,6 +12,7 @@ export interface QBittorrentConfig {
   stl: number // seeding_time_limit
   srl: number // seeding_ratio_limit
   pva: number // play_video_after
+  dwt?: number // download_wait_timeout, seconds to wait for that percentage
   cat: string // category
   wur: string // webdav_url
   wus: string // webdav_username
