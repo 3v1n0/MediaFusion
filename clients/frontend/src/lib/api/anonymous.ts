@@ -16,6 +16,7 @@ export interface QBittorrentConfigType {
   stl: number // seeding_time_limit
   srl: number // seeding_ratio_limit
   pva: number // play_video_after
+  dwt?: number // download_wait_timeout
   cat: string // category
   wur: string // webdav_url
   wus: string // webdav_username
@@ -300,6 +301,7 @@ export interface QBittorrentConfigPayload {
   seeding_time_limit?: number
   seeding_ratio_limit?: number
   play_video_after?: number
+  download_wait_timeout?: number
   category?: string
   webdav_url?: string
   webdav_username?: string
@@ -450,6 +452,7 @@ function mapQBittorrentConfig(config?: QBittorrentConfigType): QBittorrentConfig
     seeding_time_limit: config.stl,
     seeding_ratio_limit: config.srl,
     play_video_after: config.pva,
+    ...(config.dwt ? { download_wait_timeout: config.dwt } : {}),
     category: config.cat,
     webdav_url: config.wur,
     webdav_username: config.wus,

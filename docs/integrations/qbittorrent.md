@@ -74,8 +74,11 @@ WebDAV is available at `http://localhost:8080/webdav/`.
    - **MediaFusion running locally** (not in Docker): use `http://localhost:8080`
    - **MediaFusion running in Docker**: use `http://<container_ip>:8080`
 4. Enter your WebDAV credentials if you set a password; leave blank if not
-5. Adjust the **Play Video After Download** percentage (e.g. `30` = start playing when 30% is downloaded)
+5. Adjust **Play video after download** (e.g. `30` = start playing when 30% is downloaded) and the **download wait timeout** in seconds if the torrent needs longer than 5 minutes to get there
 6. Save the configuration
+
+!!! tip "Playing before the download finishes"
+    Playback starts as soon as the threshold is reached, and the player reads the file over WebDAV while qBittorrent keeps writing to it. Below 100% the bytes past the downloaded portion are still zero-filled, so playback starts and then stalls or shows artefacts — it does not fail cleanly. Pick a value you are comfortable seeking in, and note that `sequentialDownload` is enabled so the first file completes first.
 
 !!! warning "Public hosting security"
     If you expose qBittorrent-WebDAV publicly, always use a strong WebDAV password and HTTPS.
