@@ -268,10 +268,12 @@ async fn resolve(
     };
     let token: &str = if let Some(ref t) = resolved_token {
         t.as_str()
-    } else {
+    } else if provider.uses_api_token() {
         provider.token.as_deref().ok_or_else(|| {
             providers::ProviderError::api("Provider token is missing", "invalid_token.mp4")
         })?
+    } else {
+        ""
     };
 
     let record_playback = {
