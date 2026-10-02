@@ -64,11 +64,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/backend/target \
     set -eux; \
     case "$PROFILE" in \
-        dev|test) profile_dir=debug ;; \
-        bench) profile_dir=release ;; \
-        *) profile_dir="$PROFILE" ;; \
+        dev|test) \
+            profile_dir=debug; \
+            frontend_features=embed-frontend,rust-embed/debug-embed; \
+            ;; \
+        *) \
+            profile_dir="$PROFILE"; \
+            frontend_features=embed-frontend; \
+            ;; \
     esac; \
-    cargo build --profile "$PROFILE" --features embed-frontend \
+    cargo build --profile "$PROFILE" --features "$frontend_features" \
         ${BUILD_JOBS:+-j $BUILD_JOBS} \
         --bin mediafusion-api --bin mediafusion-worker; \
     mkdir -p /out; \
