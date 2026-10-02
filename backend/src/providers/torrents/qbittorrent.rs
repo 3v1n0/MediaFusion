@@ -4,6 +4,7 @@
 /// the selected file via credentialed WebDAV URL.
 use std::time::{Duration, Instant};
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::{
     Client,
     header::{COOKIE, HeaderMap, SET_COOKIE},
@@ -158,6 +159,50 @@ async fn qb_login(http: &Client, cfg: &QbConfig) -> Result<String, ProviderError
             "qbittorrent_error.mp4",
         )
     })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct QbFile {
+    index: usize,
+    name: String,
+    size: i64,
+}
+
+async fn qb_torrent_files(
+    http: &Client,
+    cfg: &QbConfig,
+    session_cookie: &str,
+    info_hash: &str,
+) -> Result<Vec<QbFile>, ProviderError> {
+    let url = format!("{}/api/v2/torrents/files?hash={info_hash}", cfg.qb_url);
+    let arr: Vec<Value> = http
+        .get(&url)
+        .header(COOKIE, session_cookie)
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(qb_files_from_json(&arr))
+}
+
+/// Read the rows `torrents/files` returned.
+fn qb_files_from_json(arr: &[Value]) -> Vec<QbFile> {
+    arr.iter()
+        .enumerate()
+        .filter_map(|(position, v)| {
+            let name = v.get("name").and_then(|n| n.as_str())?;
+            // `index` only exists since API v2.8.2; fall back to array order.
+            let index = v
+                .get("index")
+                .and_then(|i| i.as_i64())
+                .map_or(position, |i| i.max(0) as usize);
+            Some(QbFile {
+                index,
+                name: name.replace('\\', "/"),
+                size: v.get("size").and_then(|s| s.as_i64()).unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 async fn qb_torrent_info(
@@ -404,15 +449,83 @@ fn classify_href<'a>(href: &'a str, dir: &str) -> Option<Href<'a>> {
     })
 }
 
+/// Structural characters that must be escaped in a URL path segment.
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'[')
+    .add(b']');
+
+/// Percent-encode each segment of an on-disk path for use in an href.
+fn encode_path_segments(path: &str) -> String {
+    path.split('/')
+        .map(|seg| utf8_percent_encode(seg, PATH_SEGMENT).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Build the WebDAV href for one of a torrent's files.
+fn torrent_file_href(wdp: &str, info_hash: &str, relative_name: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        wdp.trim_matches('/'),
+        info_hash,
+        encode_path_segments(relative_name.trim_start_matches('/'))
+    )
+    .trim_start_matches('/')
+    .to_string()
+}
+
 async fn find_file(
     http: &Client,
     cfg: &QbConfig,
+    session_cookie: &str,
     info_hash: &str,
     torrent_name: &str,
     filename: Option<&str>,
     season: Option<i32>,
     episode: Option<i32>,
 ) -> Result<String, ProviderError> {
+    let qb_files = qb_torrent_files(http, cfg, session_cookie, info_hash)
+        .await
+        .unwrap_or_default();
+    if !qb_files.is_empty() {
+        let files: Vec<FileEntry> = qb_files
+            .iter()
+            .map(|f| FileEntry {
+                index: f.index,
+                name: f.name.clone(),
+                size: f.size,
+            })
+            .collect();
+        if let Ok(idx) =
+            select_torrent_file_index(&files, torrent_name, filename, season, episode, None, None)
+        {
+            for root in &cfg.downloads_paths {
+                let href = torrent_file_href(root, info_hash, &files[idx].name);
+                if webdav::exists(
+                    http,
+                    &cfg.webdav_url,
+                    &href,
+                    &cfg.webdav_user,
+                    &cfg.webdav_pass,
+                )
+                .await
+                {
+                    return Ok(href);
+                }
+            }
+        }
+    }
+
     for root in &cfg.downloads_paths {
         let path = format!("{}/{}", root.trim_end_matches('/'), info_hash);
         let files = list_webdav_files_recursive(http, cfg, &path).await?;
@@ -479,6 +592,7 @@ pub async fn get_video_url(
     let file_path = match find_file(
         http,
         &cfg,
+        &session_cookie,
         info_hash,
         torrent_name,
         filename,
@@ -494,6 +608,7 @@ pub async fn get_video_url(
             find_file(
                 http,
                 &cfg,
+                &session_cookie,
                 info_hash,
                 torrent_name,
                 filename,
@@ -608,8 +723,39 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS, Href, classify_href, parse_config, session_cookie,
+        DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS, Href, QbFile, classify_href, encode_path_segments,
+        parse_config, qb_files_from_json, session_cookie, torrent_file_href,
     };
+
+    #[test]
+    fn file_positions_stand_in_when_qbittorrent_omits_index() {
+        // `index` only exists since API v2.8.2. Selection returns a file's own
+        // index, which the caller uses to subscript the list, so falling back to
+        // usize::MAX panics instead of picking anything.
+        let rows = vec![
+            json!({"name": "Show.S01E01.mkv", "size": 10}),
+            json!({"name": "Show.S01E02.mkv", "size": 20}),
+            json!({"name": "Show.S01E03.mkv", "size": 30}),
+        ];
+        let files = qb_files_from_json(&rows);
+        assert_eq!(
+            files.iter().map(|f| f.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn an_explicit_index_is_preferred_over_the_position() {
+        let rows = vec![
+            json!({"index": 2, "name": "b.mkv", "size": 1}),
+            json!({"index": 0, "name": "a.mkv", "size": 1}),
+        ];
+        let files = qb_files_from_json(&rows);
+        assert_eq!(
+            files.iter().map(|f| f.index).collect::<Vec<_>>(),
+            vec![2, 0]
+        );
+    }
 
     #[test]
     fn download_wait_timeout_defaults_to_five_minutes() {
@@ -701,7 +847,33 @@ mod tests {
     }
 
     #[test]
-    fn extracts_qbittorrent_sid_cookie() {
+    fn torrent_file_href_builds_an_encoded_webdav_path() {
+        assert_eq!(
+            torrent_file_href("/", "abc123", "movie.mkv"),
+            "abc123/movie.mkv"
+        );
+        assert_eq!(
+            torrent_file_href("/", "abc123", "Show.S01/Some File[tag].mkv"),
+            "abc123/Show.S01/Some%20File%5Btag%5D.mkv"
+        );
+        assert_eq!(
+            torrent_file_href("/downloads", "abc123", "Sub/movie.mkv"),
+            "downloads/abc123/Sub/movie.mkv"
+        );
+    }
+
+    #[test]
+    fn encode_path_segments_keeps_separators_and_sub_delims() {
+        assert_eq!(
+            encode_path_segments("Show.S01/Some File.mkv"),
+            "Show.S01/Some%20File.mkv"
+        );
+        assert_eq!(encode_path_segments("100%25.mkv"), "100%2525.mkv");
+        assert_eq!(encode_path_segments("a+b,c;d=e@f.mkv"), "a+b,c;d=e@f.mkv");
+    }
+
+    #[test]
+    fn extract_qbittorrent_sid_cookie() {
         let mut headers = HeaderMap::new();
         headers.append(SET_COOKIE, HeaderValue::from_static("theme=dark; Path=/"));
         headers.append(

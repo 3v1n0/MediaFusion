@@ -47,6 +47,35 @@ pub async fn list(
     parse_hrefs(&xml)
 }
 
+/// Whether `href`, relative to the WebDAV root, resolves to something.
+pub async fn exists(
+    http: &reqwest::Client,
+    webdav_base: &str,
+    href: &str,
+    username: &str,
+    password: &str,
+) -> bool {
+    let url = format!(
+        "{}/{}",
+        webdav_base.trim_end_matches('/'),
+        href.trim_start_matches('/')
+    );
+    let method = reqwest::Method::from_bytes(b"PROPFIND").unwrap_or(reqwest::Method::GET);
+    let resp = http
+        .request(method, &url)
+        .header("Depth", "0")
+        .basic_auth(username, Some(password))
+        .send()
+        .await;
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            status.is_success() || status == reqwest::StatusCode::MULTI_STATUS
+        }
+        Err(_) => false,
+    }
+}
+
 fn parse_hrefs(xml: &str) -> Result<Vec<String>, ProviderError> {
     let mut hrefs: Vec<String> = Vec::new();
     let mut reader = Reader::from_str(xml);
