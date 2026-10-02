@@ -1,0 +1,15 @@
+# Builds the current code into the API image instead of pulling a release, for
+# testing local changes without a Rust or Node toolchain on the host:
+#   docker compose -f docker-compose-minimal.yml -f docker-compose-local.yml up -d --build
+#
+# PROFILE=dev compiles several times faster than release, which matters on
+# arm64 hardware: --build-arg PROFILE=dev
+services:
+  mediafusion-api:
+    image: mediafusion:local
+    build:
+      context: ../..
+      dockerfile: deployment/Dockerfile.local
+      args:
+        PROFILE: release
+        VERSION: 6.1.6-local
