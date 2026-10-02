@@ -358,24 +358,57 @@ async fn list_webdav_files_recursive(
         .await?;
 
         for href in hrefs {
-            let name = href.rsplit('/').next().unwrap_or(&href).to_string();
-            if name.is_empty() {
-                continue;
-            }
-            let lower = name.to_lowercase();
-            if lower.ends_with('/') {
-                stack.push(format!("{dir}/{name}"));
-            } else if super::super::usenet::is_video_name(&lower) {
-                files.push(FileEntry {
-                    index: idx,
-                    name: href.clone(),
-                    size: 0,
-                });
-                idx += 1;
+            if let Some(name) = classify_href(&href, &dir) {
+                match name {
+                    Href::Dir(name) => stack.push(format!("{dir}/{name}")),
+                    Href::File(name)
+                        if super::super::usenet::is_video_name(&name.to_lowercase()) =>
+                    {
+                        files.push(FileEntry {
+                            index: idx,
+                            name: href.clone(),
+                            size: 0,
+                        });
+                        idx += 1;
+                    }
+                    Href::File(_) => {}
+                }
             }
         }
     }
     Ok(files)
+}
+
+enum Href<'a> {
+    Dir(&'a str),
+    File(&'a str),
+}
+
+/// Classify a PROPFIND href relative to the directory that was listed.
+///
+/// A collection href carries a trailing `/`, so its basename has to be taken
+/// after stripping it — `rsplit('/').next()` on `.../Some.Release/` yields an
+/// empty string, which silently dropped every subdirectory and made the walk
+/// stop at the top. Multi-file torrents nest their video in such a directory,
+/// so they never resolved at any download progress.
+fn classify_href<'a>(href: &'a str, dir: &str) -> Option<Href<'a>> {
+    let is_dir = href.ends_with('/');
+    let trimmed = href.trim_end_matches('/');
+    let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if name.is_empty() {
+        return None;
+    }
+    // PROPFIND echoes the collection itself as the first href; descending into
+    // it would request a path that does not exist. `dir` is what we asked for
+    // (no leading slash) while hrefs are absolute, so normalise both sides.
+    if trimmed.trim_matches('/') == dir.trim_matches('/') {
+        return None;
+    }
+    Some(if is_dir {
+        Href::Dir(name)
+    } else {
+        Href::File(name)
+    })
 }
 
 async fn find_file(
@@ -581,7 +614,9 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderValue, SET_COOKIE};
     use serde_json::json;
 
-    use super::{DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS, parse_config, session_cookie};
+    use super::{
+        DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS, Href, classify_href, parse_config, session_cookie,
+    };
 
     #[test]
     fn download_wait_timeout_defaults_to_five_minutes() {
@@ -640,6 +675,44 @@ mod tests {
 
             assert_eq!(cfg.play_video_after, expected, "{raw}");
         }
+    }
+
+    #[test]
+    fn classify_href_treats_a_trailing_slash_as_a_directory() {
+        // The regression: the basename of ".../Some.Release/" is empty once the
+        // slash is left in, so subdirectories were dropped and multi-file
+        // torrents never resolved.
+        assert!(matches!(
+            classify_href("/abc/Some.Release/", "/abc"),
+            Some(Href::Dir("Some.Release"))
+        ));
+        assert!(matches!(
+            classify_href("/abc/movie.mkv", "/abc"),
+            Some(Href::File("movie.mkv"))
+        ));
+        // Names containing dots or spaces must survive untouched.
+        assert!(matches!(
+            classify_href("/abc/Show.S01.2160p.WEB-DL/", "/abc"),
+            Some(Href::Dir("Show.S01.2160p.WEB-DL"))
+        ));
+        assert!(matches!(
+            classify_href("/abc/Ben The Men.mkv", "/abc"),
+            Some(Href::File("Ben The Men.mkv"))
+        ));
+    }
+
+    #[test]
+    fn classify_href_skips_the_listed_collection_itself() {
+        // PROPFIND echoes the collection as its first href; walking into it
+        // would request a path that does not exist.
+        assert!(classify_href("/abc/", "/abc").is_none());
+        assert!(classify_href("/abc", "/abc").is_none());
+        // `dir` is the path we requested (no leading slash), hrefs are absolute.
+        assert!(classify_href("/abc/sub/", "abc/sub").is_none());
+        assert!(classify_href("/abc/", "abc").is_none());
+        // A sibling collection is still walked.
+        assert!(classify_href("/abc/other/", "/abc").is_some());
+        assert!(classify_href("/abc/other/", "abc").is_some());
     }
 
     #[test]
