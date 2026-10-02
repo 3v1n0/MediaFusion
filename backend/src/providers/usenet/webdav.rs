@@ -2,6 +2,7 @@
 ///
 /// Uses a PROPFIND Depth:1 request to list the download directory, then
 /// selects the best-matching video file by season/episode or size.
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use quick_xml::{Reader, events::Event};
 
 use crate::providers::ProviderError;
@@ -122,6 +123,41 @@ pub fn select_video(
         .map(|s| (*s).to_string())
 }
 
+/// Characters that may not appear literally in the RFC 3986 `userinfo`
+/// component, which is `*( unreserved / pct-encoded / sub-delims / ":" )`.
+/// Everything else — letters, digits, `-._~` and the sub-delims
+/// ``!$&'()*+,;=`` plus `:` — is left alone.
+///
+/// Two details matter here. `*` is a sub-delim and stays literal;
+/// `encodeURIComponent` used to turn it into `%2A`, and players that pass
+/// userinfo through without decoding it then sent the wrong password and got
+/// a 401. And `%` has to be escaped explicitly, because it is the escape
+/// character itself: leaving it bare means a client that *does* decode
+/// userinfo turns a password containing `%25` into `%`, silently wrong.
+const USERINFO: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'/')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+/// Percent-encode a credential for embedding in a URL's userinfo component.
+fn encode_userinfo(value: &str) -> String {
+    utf8_percent_encode(value, USERINFO).to_string()
+}
+
 /// Build a WebDAV URL with `user:pass@` embedded in the authority.
 pub fn url_with_creds(
     webdav_base: &str,
@@ -129,8 +165,8 @@ pub fn url_with_creds(
     username: &str,
     password: &str,
 ) -> String {
-    let enc_u = urlencoding::encode(username);
-    let enc_p = urlencoding::encode(password);
+    let enc_u = encode_userinfo(username);
+    let enc_p = encode_userinfo(password);
     let file = file_path.trim_start_matches('/');
     if let Some(rest) = webdav_base.strip_prefix("https://") {
         format!(
@@ -144,5 +180,119 @@ pub fn url_with_creds(
         )
     } else {
         format!("{}/{file}", webdav_base.trim_end_matches('/'))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use percent_encoding::percent_decode_str;
+
+    use super::{encode_userinfo, url_with_creds};
+
+    /// What a client without userinfo decoding would send as the Basic password.
+    fn naive_basic_password(url: &str) -> String {
+        let after_scheme = url.split_once("://").expect("scheme").1;
+        let userinfo = after_scheme.split_once('@').expect("userinfo").0;
+        let (_user, pass) = userinfo.split_once(':').expect("user:pass");
+        pass.to_string()
+    }
+
+    /// What a conformant client sends: percent-decoded userinfo.
+    fn decoded_basic_password(url: &str) -> String {
+        let naive = naive_basic_password(url);
+        percent_decode_str(&naive).decode_utf8_lossy().into_owned()
+    }
+
+    #[test]
+    fn star_and_sub_delims_stay_literal() {
+        // '*' is a sub-delim and legal in userinfo. encodeURIComponent turned it
+        // into %2A, which players that skip userinfo decoding sent verbatim.
+        // ':' is legal in userinfo too, and the password is whatever follows the
+        // first colon, so it needs no escaping either.
+        for raw in ["a*b*c", "x!y$z&w'v(u)t,s;q=r", "pass:with:colons"] {
+            assert_eq!(encode_userinfo(raw), raw, "{raw}");
+        }
+    }
+
+    #[test]
+    fn structurally_significant_characters_are_escaped() {
+        assert_eq!(encode_userinfo("a@b"), "a%40b");
+        assert_eq!(encode_userinfo("a/b"), "a%2Fb");
+        assert_eq!(encode_userinfo("a b"), "a%20b");
+        assert_eq!(encode_userinfo("a?b"), "a%3Fb");
+        assert_eq!(encode_userinfo("a#b"), "a%23b");
+        assert_eq!(encode_userinfo("a[b]"), "a%5Bb%5D");
+        assert_eq!(encode_userinfo("a\\b"), "a%5Cb");
+    }
+
+    #[test]
+    fn percent_is_escaped_so_decoding_round_trips() {
+        // '%' is the escape character itself, so leaving it bare would let a
+        // decoding client mangle a password that happens to contain "%25".
+        assert_eq!(encode_userinfo("a%b"), "a%25b");
+        assert_eq!(encode_userinfo("50%"), "50%25");
+
+        for raw in ["Vd*p3hEc*VcKVV%", "a%b", "a%25b", "plain", "p@ss w:rd#1"] {
+            let url = url_with_creds("http://dav/webdav", "/f.mkv", "u", raw);
+            assert_eq!(decoded_basic_password(&url), raw, "{raw}");
+        }
+    }
+
+    #[test]
+    fn unreserved_passwords_need_no_encoding_at_all() {
+        // The recommended shape: nothing is escaped, so naive and decoding
+        // clients agree and neither can get it wrong.
+        for raw in [
+            "kQw7Zr4Tn9Xb2Vm6L",
+            "kQw7Zr4Tn9Xb2-Vm6L",
+            "kQw7Zr4Tn9Xb2_Vm6L",
+        ] {
+            let url = url_with_creds("http://dav/webdav", "/f.mkv", "marco", raw);
+
+            assert_eq!(naive_basic_password(&url), raw, "{raw}");
+            assert_eq!(decoded_basic_password(&url), raw, "{raw}");
+            assert!(!url.contains('%'), "{url}");
+        }
+    }
+
+    #[test]
+    fn star_password_works_for_clients_that_skip_userinfo_decoding() {
+        // The regression: encodeURIComponent produced %2A here, so such a client
+        // authenticated with "Vd%2A..." and the server answered 401.
+        let password = "Vd*p3hEc*VcKVV";
+        let url = url_with_creds("http://dav/webdav", "/f.mkv", "marco", password);
+
+        assert_eq!(naive_basic_password(&url), password);
+        assert!(!url.contains("%2A"), "{url}");
+    }
+
+    #[test]
+    fn credentials_survive_a_conformant_client() {
+        let password = "p@ss w:rd#1";
+        let url = url_with_creds("http://dav/webdav", "/f.mkv", "us er", password);
+
+        assert_eq!(decoded_basic_password(&url), password);
+    }
+
+    #[test]
+    fn url_keeps_scheme_host_and_path_intact() {
+        let url = url_with_creds(
+            "https://mediafusion.example/webdav/",
+            "/some/dir/file.mkv",
+            "marco",
+            "kQw7Zr4Tn9Xb2-Vm6L",
+        );
+
+        assert_eq!(
+            url,
+            "https://marco:kQw7Zr4Tn9Xb2-Vm6L@mediafusion.example/webdav/some/dir/file.mkv"
+        );
+    }
+
+    #[test]
+    fn plain_credentials_are_untouched() {
+        let url = url_with_creds("http://dav/webdav", "/f.mkv", "user", "pass");
+
+        assert_eq!(url, "http://user:pass@dav/webdav/f.mkv");
     }
 }
