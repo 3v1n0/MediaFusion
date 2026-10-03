@@ -175,6 +175,15 @@ struct QbFile {
     progress: f64,
 }
 
+/// What `torrents/info` reports about the torrent as a whole.
+///
+/// Its `progress` is deliberately not kept: it averages over every file, so a
+/// season pack reads as finished while the episode being played has barely
+/// started. Use the per-file number from `torrents/files` instead.
+struct QbTorrent {
+    state: String,
+}
+
 /// Per-file metadata straight from qBittorrent.
 ///
 /// Without this the WebDAV walk is the only source, and it cannot report a
@@ -301,28 +310,66 @@ async fn qb_wait_for_files(
 /// Wait for the one file we selected, not the torrent as a whole: a season pack
 /// reports its progress as the average over every file, so the torrent can read
 /// as done while the episode we want has barely started.
-async fn qb_wait_for_file(
+/// Wait until the file we picked is both at the configured progress and on
+/// disk, since WebDAV can only serve what is actually there.
+///
+/// The database still lists a torrent as downloaded after its data is removed,
+/// and qBittorrent keeps reporting such a torrent as complete. When the file is
+/// missing at full progress, recheck so the missing pieces are wanted again and
+/// the wait carries on over the re-download instead of failing outright.
+async fn qb_wait_until_playable(
     http: &Client,
     cfg: &QbConfig,
     session_cookie: &str,
     info_hash: &str,
     wanted: usize,
+    href: &str,
 ) -> Result<(), ProviderError> {
     let threshold = cfg.play_video_after as f64 / 100.0;
     let deadline = Instant::now() + Duration::from_secs(cfg.download_wait_timeout_secs);
     let mut last_progress = 0.0f64;
+    let mut rechecked = false;
 
     loop {
         if let Ok(files) = qb_torrent_files(http, cfg, session_cookie, info_hash).await
             && let Some(f) = files.get(wanted)
         {
             last_progress = f.progress;
-            if last_progress >= threshold {
+            if f.progress >= threshold
+                && webdav::exists(
+                    http,
+                    &cfg.webdav_url,
+                    href,
+                    &cfg.webdav_user,
+                    &cfg.webdav_pass,
+                )
+                .await
+            {
                 return Ok(());
             }
+            if f.progress >= threshold && !rechecked {
+                rechecked = true;
+                tracing::debug!(
+                    info_hash = %info_hash,
+                    "qBittorrent calls the file complete but WebDAV does not have it; rechecking"
+                );
+                qb_post(
+                    http,
+                    cfg,
+                    session_cookie,
+                    "/api/v2/torrents/recheck",
+                    info_hash,
+                )
+                .await?;
+            }
         }
+
         if Instant::now() >= deadline {
             break;
+        }
+        // A stopped or paused torrent never advances, so keep nudging it.
+        if let Ok(Some(status)) = qb_torrent_info(http, cfg, session_cookie, info_hash).await {
+            let _ = qb_ensure_running(http, cfg, session_cookie, info_hash, &status).await;
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
@@ -345,12 +392,37 @@ async fn qb_wait_for_file(
     ))
 }
 
+/// POST one of qBittorrent's torrent actions, addressing the torrent by hash.
+async fn qb_post(
+    http: &Client,
+    cfg: &QbConfig,
+    session_cookie: &str,
+    endpoint: &str,
+    info_hash: &str,
+) -> Result<(), ProviderError> {
+    let url = format!("{}{endpoint}", cfg.qb_url);
+    let resp = http
+        .post(&url)
+        .header(COOKIE, session_cookie)
+        .form(&[("hashes", info_hash)])
+        .send()
+        .await?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    let text = resp.text().await.unwrap_or_default().to_lowercase();
+    Err(ProviderError::api(
+        format!("qBittorrent {endpoint} failed: {text}"),
+        "torrent_not_downloaded.mp4",
+    ))
+}
+
 async fn qb_torrent_info(
     http: &Client,
     cfg: &QbConfig,
     session_cookie: &str,
     info_hash: &str,
-) -> Result<Option<f64>, ProviderError> {
+) -> Result<Option<QbTorrent>, ProviderError> {
     let url = format!("{}/api/v2/torrents/info?hashes={info_hash}", cfg.qb_url);
     let arr: Vec<Value> = http
         .get(&url)
@@ -359,9 +431,51 @@ async fn qb_torrent_info(
         .await?
         .json()
         .await?;
-    Ok(arr
-        .first()
-        .and_then(|t| t.get("progress").and_then(|v| v.as_f64())))
+    Ok(arr.first().map(|t| QbTorrent {
+        state: t
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    }))
+}
+
+/// qBittorrent keeps a torrent paused or stopped once its ratio/time limits are
+/// reached, and reports one whose data was deleted as `missingFiles`. Either
+/// way the bytes never arrive on their own, so playback has to restart it.
+async fn qb_ensure_running(
+    http: &Client,
+    cfg: &QbConfig,
+    session_cookie: &str,
+    info_hash: &str,
+    status: &QbTorrent,
+) -> Result<(), ProviderError> {
+    let (endpoint, matches_state) = match status.state.as_str() {
+        "stopped" | "paused" | "pausedDL" | "pausedUP" => ("/api/v2/torrents/start", true),
+        "missingFiles" => ("/api/v2/torrents/recheck", true),
+        "error" => ("/api/v2/torrents/recheck", true),
+        _ => return Ok(()),
+    };
+    if !matches_state {
+        return Ok(());
+    }
+
+    tracing::debug!(info_hash = %info_hash, state = %status.state, "restarting torrent");
+    let url = format!("{}{endpoint}", cfg.qb_url);
+    let resp = http
+        .post(&url)
+        .header(COOKIE, session_cookie)
+        .form(&[("hashes", info_hash)])
+        .send()
+        .await?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    let text = resp.text().await.unwrap_or_default().to_lowercase();
+    Err(ProviderError::api(
+        format!("qBittorrent could not restart the torrent: {text}"),
+        "torrent_not_downloaded.mp4",
+    ))
 }
 
 async fn qb_add_torrent(
@@ -624,18 +738,12 @@ async fn find_file(
         {
             // Only this file, so a season pack does not queue the whole run.
             qb_select_only_file(http, cfg, session_cookie, info_hash, &qb_files, idx).await?;
-            qb_wait_for_file(http, cfg, session_cookie, info_hash, idx).await?;
 
             for root in &cfg.downloads_paths {
                 let href = torrent_file_href(root, info_hash, &files[idx].name);
-                if webdav::exists(
-                    http,
-                    &cfg.webdav_url,
-                    &href,
-                    &cfg.webdav_user,
-                    &cfg.webdav_pass,
-                )
-                .await
+                if qb_wait_until_playable(http, cfg, session_cookie, info_hash, idx, &href)
+                    .await
+                    .is_ok()
                 {
                     return Ok(href);
                 }
@@ -697,8 +805,13 @@ pub async fn get_video_url(
     let cfg = parse_config(config)?;
     let session_cookie = qb_login(http, &cfg).await?;
 
-    let existing_progress = qb_torrent_info(http, &cfg, &session_cookie, info_hash).await?;
-    if existing_progress.is_none() {
+    let existing = qb_torrent_info(http, &cfg, &session_cookie, info_hash).await?;
+    if let Some(status) = existing.as_ref() {
+        // A torrent that finished, was stopped or lost its data never advances
+        // on its own, so restart it before waiting on it.
+        qb_ensure_running(http, &cfg, &session_cookie, info_hash, status).await?;
+    }
+    if existing.is_none() {
         qb_add_torrent(
             http,
             &cfg,
@@ -728,7 +841,7 @@ pub async fn get_video_url(
     {
         Ok(p) => p,
         Err(e) => {
-            if existing_progress.is_some() {
+            if existing.is_some() {
                 // Already known and the add would be a no-op, so the failure is
                 // real: no matching file, or it never finished downloading.
                 return Err(e);
