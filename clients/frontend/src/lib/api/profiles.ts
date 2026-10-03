@@ -12,6 +12,10 @@ export interface StreamingProviderInfo {
 export interface StreamingProvidersSummary {
   providers: StreamingProviderInfo[]
   has_debrid: boolean
+  // True for any enabled provider, including ones like qBittorrent that have no
+  // debrid token. Gating features that need "a provider at all" on has_debrid
+  // hides them from torrent-only setups.
+  has_streaming_provider: boolean
   primary_service: string | null
 }
 

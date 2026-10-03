@@ -273,6 +273,7 @@ fn build_streaming_providers_summary(full_config: &serde_json::Value) -> serde_j
 
     let mut providers = Vec::new();
     let mut has_debrid = false;
+    let mut has_streaming_provider = false;
     let mut primary_service: Option<String> = None;
 
     for (i, p) in providers_arr.iter().enumerate() {
@@ -305,6 +306,12 @@ fn build_streaming_providers_summary(full_config: &serde_json::Value) -> serde_j
         if enabled && has_credentials {
             has_debrid = true;
         }
+        // qBittorrent authenticates with a URL plus WebDAV credentials and
+        // carries none of the debrid token fields above, so requiring one
+        // hides the library from a perfectly usable torrent provider.
+        if enabled && !service.is_empty() {
+            has_streaming_provider = true;
+        }
         if i == 0 && !service.is_empty() {
             primary_service = Some(service.clone());
         }
@@ -319,6 +326,7 @@ fn build_streaming_providers_summary(full_config: &serde_json::Value) -> serde_j
     serde_json::json!({
         "providers": providers,
         "has_debrid": has_debrid,
+        "has_streaming_provider": has_streaming_provider,
         "primary_service": primary_service,
     })
 }
