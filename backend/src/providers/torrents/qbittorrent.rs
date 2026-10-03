@@ -191,6 +191,9 @@ struct QbFile {
 /// started. Use the per-file number from `torrents/files` instead.
 struct QbTorrent {
     state: String,
+    /// Reported as `f_l_piece_prio`. Read back so an existing torrent can be
+    /// corrected without blindly flipping it: the API only offers a toggle.
+    first_last_piece_prio: bool,
 }
 
 /// Per-file metadata straight from qBittorrent.
@@ -440,13 +443,22 @@ async fn qb_torrent_info(
         .await?
         .json()
         .await?;
-    Ok(arr.first().map(|t| QbTorrent {
-        state: t
+    Ok(arr.first().and_then(qb_torrent_from_json))
+}
+
+/// Read one `torrents/info` row.
+fn qb_torrent_from_json(row: &Value) -> Option<QbTorrent> {
+    Some(QbTorrent {
+        state: row
             .get("state")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
-    }))
+        first_last_piece_prio: row
+            .get("f_l_piece_prio")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
 }
 
 /// qBittorrent keeps a torrent paused or stopped once its ratio/time limits are
@@ -459,32 +471,47 @@ async fn qb_ensure_running(
     info_hash: &str,
     status: &QbTorrent,
 ) -> Result<(), ProviderError> {
-    let (endpoint, matches_state) = match status.state.as_str() {
-        "stopped" | "paused" | "pausedDL" | "pausedUP" => ("/api/v2/torrents/start", true),
-        "missingFiles" => ("/api/v2/torrents/recheck", true),
-        "error" => ("/api/v2/torrents/recheck", true),
+    let endpoint = match status.state.as_str() {
+        "stopped" | "paused" | "pausedDL" | "pausedUP" => "/api/v2/torrents/start",
+        "missingFiles" | "error" => "/api/v2/torrents/recheck",
         _ => return Ok(()),
     };
-    if !matches_state {
+
+    tracing::debug!(info_hash = %info_hash, state = %status.state, "restarting torrent");
+    qb_post(http, cfg, session_cookie, endpoint, info_hash).await
+}
+
+/// Bring an existing torrent's piece priority in line with the profile.
+///
+/// `torrents/add` only sets this on torrents MediaFusion created, and the API
+/// offers no way to set it afterwards — `toggleFirstLastPiecePrio` is a blind
+/// flip. `torrents/info` does report the current value as `f_l_piece_prio`, so
+/// compare first and only toggle when it is actually wrong.
+async fn qb_ensure_piece_priority(
+    http: &Client,
+    cfg: &QbConfig,
+    session_cookie: &str,
+    info_hash: &str,
+    status: &QbTorrent,
+) -> Result<(), ProviderError> {
+    if status.first_last_piece_prio == cfg.first_last_piece_prio {
         return Ok(());
     }
 
-    tracing::debug!(info_hash = %info_hash, state = %status.state, "restarting torrent");
-    let url = format!("{}{endpoint}", cfg.qb_url);
-    let resp = http
-        .post(&url)
-        .header(COOKIE, session_cookie)
-        .form(&[("hashes", info_hash)])
-        .send()
-        .await?;
-    if resp.status().is_success() {
-        return Ok(());
-    }
-    let text = resp.text().await.unwrap_or_default().to_lowercase();
-    Err(ProviderError::api(
-        format!("qBittorrent could not restart the torrent: {text}"),
-        "torrent_not_downloaded.mp4",
-    ))
+    tracing::debug!(
+        info_hash = %info_hash,
+        current = %status.first_last_piece_prio,
+        wanted = %cfg.first_last_piece_prio,
+        "toggling first/last piece priority"
+    );
+    qb_post(
+        http,
+        cfg,
+        session_cookie,
+        "/api/v2/torrents/toggleFirstLastPiecePrio",
+        info_hash,
+    )
+    .await
 }
 
 async fn qb_add_torrent(
@@ -835,6 +862,7 @@ pub async fn get_video_url(
         // A torrent that finished, was stopped or lost its data never advances
         // on its own, so restart it before waiting on it.
         qb_ensure_running(http, &cfg, &session_cookie, info_hash, status).await?;
+        qb_ensure_piece_priority(http, &cfg, &session_cookie, info_hash, status).await?;
     }
     if existing.is_none() {
         qb_add_torrent(
@@ -991,8 +1019,8 @@ mod tests {
 
     use super::{
         DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS, Href, QbFile, classify_href, encode_path_segments,
-        file_entries_of, parse_config, select_torrent_file_index, session_cookie,
-        torrent_file_href,
+        file_entries_of, parse_config, qb_torrent_from_json, select_torrent_file_index,
+        session_cookie, torrent_file_href,
     };
 
     #[test]
@@ -1064,6 +1092,36 @@ mod tests {
         let idx = select_torrent_file_index(&files, "Show", None, Some(1), Some(3), None, None)
             .expect("S01E03 should be selectable");
         assert_eq!(files[idx].name, "Show.S01E03.mkv");
+    }
+
+    #[test]
+    fn reads_state_and_first_last_prio_off_a_torrents_info_row() {
+        // `f_l_piece_prio` is the field name the API actually uses; reading the
+        // wrong one silently reports false and would toggle every torrent on
+        // every resolve.
+        let row = json!({
+            "hash": "abc",
+            "name": "Show.S01E01.mkv",
+            "state": "downloading",
+            "seq_dl": true,
+            "f_l_piece_prio": true,
+            "category": "MediaFusion",
+            "amount_left": 0,
+        });
+        let t = qb_torrent_from_json(&row).unwrap();
+        assert_eq!(t.state, "downloading");
+        assert!(t.first_last_piece_prio);
+
+        // `seq_dl` must not be mistaken for the piece priority.
+        let row_off = json!({"state": "pausedDL", "seq_dl": true, "f_l_piece_prio": false});
+        let t = qb_torrent_from_json(&row_off).unwrap();
+        assert_eq!(t.state, "pausedDL");
+        assert!(!t.first_last_piece_prio);
+
+        // An older build that omits the field must not be read as needing a
+        // toggle when the profile wants it on.
+        let legacy = json!({"state": "stalledDL"});
+        assert!(!qb_torrent_from_json(&legacy).unwrap().first_last_piece_prio);
     }
 
     #[test]
