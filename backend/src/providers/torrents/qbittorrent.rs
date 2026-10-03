@@ -20,6 +20,8 @@ use crate::providers::{
 /// Keeps the previous 60 x 5s behaviour for profiles that never set one.
 const DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS: i64 = 300;
 
+const METADATA_WAIT_SECS: u64 = 20;
+
 #[derive(Debug, Clone)]
 struct QbConfig {
     qb_url: String,
@@ -30,7 +32,6 @@ struct QbConfig {
     webdav_pass: String,
     downloads_paths: Vec<String>,
     play_video_after: i32,
-    /// How long to wait for a torrent to reach `play_video_after`, in seconds.
     download_wait_timeout_secs: u64,
     seeding_time_limit: i32,
     seeding_ratio_limit: f64,
@@ -166,6 +167,7 @@ struct QbFile {
     index: usize,
     name: String,
     size: i64,
+    progress: f64,
 }
 
 async fn qb_torrent_files(
@@ -200,9 +202,156 @@ fn qb_files_from_json(arr: &[Value]) -> Vec<QbFile> {
                 index,
                 name: name.replace('\\', "/"),
                 size: v.get("size").and_then(|s| s.as_i64()).unwrap_or(0),
+                progress: v.get("progress").and_then(|p| p.as_f64()).unwrap_or(0.0),
             })
         })
         .collect()
+}
+
+fn file_entries_of(qb_files: &[QbFile]) -> Vec<FileEntry> {
+    qb_files
+        .iter()
+        .map(|f| FileEntry {
+            index: f.index,
+            name: f.name.clone(),
+            size: f.size,
+        })
+        .collect()
+}
+
+/// qBittorrent `DownloadPriority` values.
+const FILE_PRIORITY_IGNORED: i32 = 0;
+const FILE_PRIORITY_NORMAL: i32 = 1;
+
+/// The priorities to apply so that only `wanted` is downloaded.
+fn file_prio_requests(count: usize, wanted: usize) -> Vec<(String, i32)> {
+    let others: Vec<String> = (0..count)
+        .filter(|i| *i != wanted)
+        .map(|i| i.to_string())
+        .collect();
+    let mut requests = Vec::new();
+    if !others.is_empty() {
+        requests.push((others.join("|"), FILE_PRIORITY_IGNORED));
+    }
+    // The wanted file goes back to Normal, since a previous resolve for another
+    // file in the same torrent may have turned it off.
+    requests.push((wanted.to_string(), FILE_PRIORITY_NORMAL));
+    requests
+}
+
+/// Deselect every file but `wanted`; qBittorrent splits the `id` list on `|`.
+async fn qb_select_only_file(
+    http: &Client,
+    cfg: &QbConfig,
+    session_cookie: &str,
+    info_hash: &str,
+    files: &[QbFile],
+    wanted: usize,
+) -> Result<(), ProviderError> {
+    for (ids, priority) in file_prio_requests(files.len(), wanted) {
+        qb_file_prio(http, cfg, session_cookie, info_hash, &ids, priority).await?;
+    }
+    Ok(())
+}
+
+async fn qb_file_prio(
+    http: &Client,
+    cfg: &QbConfig,
+    session_cookie: &str,
+    info_hash: &str,
+    ids: &str,
+    priority: i32,
+) -> Result<(), ProviderError> {
+    let url = format!("{}/api/v2/torrents/filePrio", cfg.qb_url);
+    let resp = http
+        .post(&url)
+        .header(COOKIE, session_cookie)
+        .form(&[
+            ("hash", info_hash),
+            ("id", ids),
+            ("priority", &priority.to_string()),
+        ])
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default().to_lowercase();
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(ProviderError::api(
+        format!("qBittorrent refused to change file priorities: {text}"),
+        "add_torrent_failed.mp4",
+    ))
+}
+
+/// Wait for the torrent's metadata, or None so the caller can fall back.
+async fn qb_wait_for_files(
+    http: &Client,
+    cfg: &QbConfig,
+    session_cookie: &str,
+    info_hash: &str,
+) -> Option<Vec<QbFile>> {
+    let budget = cfg.download_wait_timeout_secs.clamp(1, METADATA_WAIT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(budget);
+    loop {
+        let files = qb_torrent_files(http, cfg, session_cookie, info_hash)
+            .await
+            .unwrap_or_default();
+        if !files.is_empty() {
+            return Some(files);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Wait for the one file we selected, not the torrent as a whole: a season pack
+/// reports its progress as the average over every file, so the torrent can read
+/// as done while the episode we want has barely started.
+async fn qb_wait_for_file(
+    http: &Client,
+    cfg: &QbConfig,
+    session_cookie: &str,
+    info_hash: &str,
+    wanted: usize,
+) -> Result<(), ProviderError> {
+    let threshold = cfg.play_video_after as f64 / 100.0;
+    let deadline = Instant::now() + Duration::from_secs(cfg.download_wait_timeout_secs);
+    let mut last_progress = 0.0f64;
+
+    loop {
+        if let Ok(files) = qb_torrent_files(http, cfg, session_cookie, info_hash).await
+            && let Some(f) = files.get(wanted)
+        {
+            last_progress = f.progress;
+            if last_progress >= threshold {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    tracing::debug!(
+        info_hash = %info_hash,
+        progress_pct = %(last_progress * 100.0),
+        target_pct = %cfg.play_video_after,
+        waited_secs = %cfg.download_wait_timeout_secs,
+        "qBittorrent file download wait timed out"
+    );
+    Err(ProviderError::api(
+        format!(
+            "Selected file at {:.1}% after {}s, still below the configured {}% — retry once it downloads further",
+            last_progress * 100.0,
+            cfg.download_wait_timeout_secs,
+            cfg.play_video_after
+        ),
+        "torrent_not_downloaded.mp4",
+    ))
 }
 
 async fn qb_torrent_info(
@@ -345,44 +494,6 @@ async fn qb_add_magnet(
     .await
 }
 
-async fn wait_for_progress(
-    http: &Client,
-    cfg: &QbConfig,
-    session_cookie: &str,
-    info_hash: &str,
-) -> Result<(), ProviderError> {
-    let threshold = cfg.play_video_after as f64 / 100.0;
-    let deadline = Instant::now() + Duration::from_secs(cfg.download_wait_timeout_secs);
-    let mut last_progress: Option<f64> = None;
-
-    loop {
-        if let Some(progress) = qb_torrent_info(http, cfg, session_cookie, info_hash).await? {
-            last_progress = Some(progress);
-            if progress >= threshold {
-                return Ok(());
-            }
-        }
-        if Instant::now() >= deadline {
-            let pct = last_progress.map_or(0.0, |p| p * 100.0);
-            tracing::debug!(
-                info_hash = %info_hash,
-                progress_pct = %pct,
-                target_pct = cfg.play_video_after,
-                waited_secs = cfg.download_wait_timeout_secs,
-                "qBittorrent download wait timed out"
-            );
-            return Err(ProviderError::api(
-                format!(
-                    "Torrent at {pct:.1}% after {}s, still below the configured {}% — retry once it downloads further",
-                    cfg.download_wait_timeout_secs, cfg.play_video_after
-                ),
-                "torrent_not_downloaded.mp4",
-            ));
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
-}
-
 async fn list_webdav_files_recursive(
     http: &Client,
     cfg: &QbConfig,
@@ -494,21 +605,15 @@ async fn find_file(
     season: Option<i32>,
     episode: Option<i32>,
 ) -> Result<String, ProviderError> {
-    let qb_files = qb_torrent_files(http, cfg, session_cookie, info_hash)
-        .await
-        .unwrap_or_default();
-    if !qb_files.is_empty() {
-        let files: Vec<FileEntry> = qb_files
-            .iter()
-            .map(|f| FileEntry {
-                index: f.index,
-                name: f.name.clone(),
-                size: f.size,
-            })
-            .collect();
+    let qb_files = qb_wait_for_files(http, cfg, session_cookie, info_hash).await;
+    if let Some(qb_files) = qb_files {
+        let files = file_entries_of(&qb_files);
         if let Ok(idx) =
             select_torrent_file_index(&files, torrent_name, filename, season, episode, None, None)
         {
+            qb_select_only_file(http, cfg, session_cookie, info_hash, &qb_files, idx).await?;
+            qb_wait_for_file(http, cfg, session_cookie, info_hash, idx).await?;
+
             for root in &cfg.downloads_paths {
                 let href = torrent_file_href(root, info_hash, &files[idx].name);
                 if webdav::exists(
@@ -523,6 +628,10 @@ async fn find_file(
                     return Ok(href);
                 }
             }
+            return Err(ProviderError::api(
+                "The selected file is not on disk yet",
+                "torrent_not_downloaded.mp4",
+            ));
         }
     }
 
@@ -585,8 +694,6 @@ pub async fn get_video_url(
             is_private,
         )
         .await?;
-    } else if existing_progress.is_some_and(|p| p * 100.0 < cfg.play_video_after as f64) {
-        wait_for_progress(http, &cfg, &session_cookie, info_hash).await?;
     }
 
     let file_path = match find_file(
@@ -602,9 +709,11 @@ pub async fn get_video_url(
     .await
     {
         Ok(p) => p,
-        Err(_) => {
+        Err(e) => {
+            if existing_progress.is_some() {
+                return Err(e);
+            }
             qb_add_magnet(http, &cfg, &session_cookie, magnet_link, info_hash).await?;
-            wait_for_progress(http, &cfg, &session_cookie, info_hash).await?;
             find_file(
                 http,
                 &cfg,
@@ -723,9 +832,31 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS, Href, QbFile, classify_href, encode_path_segments,
-        parse_config, qb_files_from_json, session_cookie, torrent_file_href,
+        DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS, FILE_PRIORITY_IGNORED, FILE_PRIORITY_NORMAL, Href,
+        QbFile, classify_href, encode_path_segments, file_entries_of, file_prio_requests,
+        parse_config, qb_files_from_json, select_torrent_file_index, session_cookie,
+        torrent_file_href,
     };
+
+    #[test]
+    fn the_wanted_file_is_turned_back_on() {
+        // Playing S01E03 turns every other file off; a later request for S01E04
+        // has to turn S01E04 back on or qBittorrent never downloads it and the
+        // wait times out.
+        assert_eq!(
+            file_prio_requests(4, 2),
+            vec![
+                ("0|1|3".to_string(), FILE_PRIORITY_IGNORED),
+                ("2".to_string(), FILE_PRIORITY_NORMAL),
+            ]
+        );
+        // Even a single-file torrent has to be asked for, since a previous
+        // resolve for a different file in the same torrent may have turned it off.
+        assert_eq!(
+            file_prio_requests(1, 0),
+            vec![("0".to_string(), FILE_PRIORITY_NORMAL)]
+        );
+    }
 
     #[test]
     fn file_positions_stand_in_when_qbittorrent_omits_index() {
@@ -755,6 +886,70 @@ mod tests {
             files.iter().map(|f| f.index).collect::<Vec<_>>(),
             vec![2, 0]
         );
+    }
+
+    #[test]
+    fn season_pack_picks_the_requested_episode_not_the_first_file() {
+        let dir = "Some Show Season 1 (S01) 2160p HDR 5.1 - 2.0 x265 10bit GROUP";
+        let episodes = [
+            ("Some Show S01E01 Pilot.mkv", 1_200_000_000),
+            ("Some Show S01E02 Second.mkv", 1_180_000_000),
+            ("Some Show S01E03 Third.mkv", 1_310_000_000),
+            ("Some Show S01E04 Fourth.mkv", 1_095_000_000),
+        ];
+        let qb_files: Vec<QbFile> = episodes
+            .iter()
+            .enumerate()
+            .map(|(i, (name, size))| QbFile {
+                index: i,
+                name: format!("{dir}/{name}"),
+                size: *size,
+                progress: if i == 0 { 1.0 } else { 0.0 },
+            })
+            .collect();
+
+        let files = file_entries_of(&qb_files);
+        let idx = select_torrent_file_index(
+            &files,
+            "Some Show Season 1",
+            None,
+            Some(1),
+            Some(3),
+            None,
+            None,
+        )
+        .expect("S01E03 should be selectable");
+
+        assert_eq!(idx, 2);
+        assert_eq!(
+            qb_files[idx].name,
+            format!("{dir}/Some Show S01E03 Third.mkv")
+        );
+    }
+
+    #[test]
+    fn season_pack_picks_by_episode_regardless_of_the_filename_order() {
+        let mk = |names: &[&str]| -> Vec<QbFile> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| QbFile {
+                    index: i,
+                    name: (*name).to_string(),
+                    size: 1_000_000_000,
+                    progress: 0.0,
+                })
+                .collect()
+        };
+
+        let files = file_entries_of(&mk(&[
+            "Show.S01E10.mkv",
+            "Show.S01E02.mkv",
+            "Show.S01E03.mkv",
+        ]));
+        let idx = select_torrent_file_index(&files, "Show", None, Some(1), Some(3), None, None)
+            .expect("S01E03 should be selectable");
+        assert_eq!(files[idx].name, "Show.S01E03.mkv");
     }
 
     #[test]
