@@ -749,6 +749,7 @@ async fn resolve_playback_url(
                 http,
                 cfg,
                 info_hash,
+                &state.redis,
                 &magnet,
                 &stream_info.name,
                 resolved_filename,

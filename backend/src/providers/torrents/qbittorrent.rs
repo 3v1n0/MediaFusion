@@ -4,6 +4,7 @@
 /// the selected file via credentialed WebDAV URL.
 use std::time::{Duration, Instant};
 
+use fred::{clients::Client as RedisClient, prelude::*};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::{
     Client,
@@ -170,6 +171,10 @@ struct QbFile {
     progress: f64,
 }
 
+struct QbTorrent {
+    state: String,
+}
+
 async fn qb_torrent_files(
     http: &Client,
     cfg: &QbConfig,
@@ -223,32 +228,74 @@ fn file_entries_of(qb_files: &[QbFile]) -> Vec<FileEntry> {
 const FILE_PRIORITY_IGNORED: i32 = 0;
 const FILE_PRIORITY_NORMAL: i32 = 1;
 
-/// The priorities to apply so that only `wanted` is downloaded.
-fn file_prio_requests(count: usize, wanted: usize) -> Vec<(String, i32)> {
-    let others: Vec<String> = (0..count)
-        .filter(|i| *i != wanted)
-        .map(|i| i.to_string())
-        .collect();
+/// How long a requested file stays selected, in seconds.
+///
+/// MediaFusion hands the player a redirect and is not in the data path, so it
+/// cannot see playback end; this lease stands in for that and is refreshed on
+/// every resolve. It has to be at least the playback URL cache TTL, or a cached
+/// URL can outlive the request that keeps its file downloading.
+const SELECTION_LEASE_SECS: i64 = 3600;
+
+/// Record that `wanted` has a request, and return every index that has one now.
+async fn requested_files(redis: &RedisClient, info_hash: &str, wanted: usize) -> Vec<usize> {
+    let key = format!("qbittorrent:selected:{info_hash}");
+    let _ = redis.sadd::<(), _, _>(&key, wanted as i64).await;
+    let _ = redis
+        .expire::<i64, _>(&key, SELECTION_LEASE_SECS, None)
+        .await;
+    redis
+        .smembers::<Vec<i64>, _>(&key)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|i| (i >= 0).then_some(i as usize))
+        .collect()
+}
+
+/// The priorities to apply: every file with an outstanding request is enabled
+/// and every other file is turned off.
+///
+/// The whole requested set is re-enabled on each resolve, not only the file
+/// being resolved, which makes this self-healing: a selection that failed
+/// partway through, or one whose resolution was interrupted, is repaired by the
+/// next resolve instead of leaving files switched off.
+///
+/// `requested` and the ids are qBittorrent's file indexes, which are not
+/// necessarily positions in the list it returned them in.
+fn file_prio_requests(files: &[QbFile], requested: &[usize]) -> Vec<(String, i32)> {
+    let ids = |keep: bool| {
+        files
+            .iter()
+            .map(|f| f.index)
+            .filter(|i| requested.contains(i) == keep)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("|")
+    };
     let mut requests = Vec::new();
-    if !others.is_empty() {
-        requests.push((others.join("|"), FILE_PRIORITY_IGNORED));
+    let dropped = ids(false);
+    if !dropped.is_empty() {
+        requests.push((dropped, FILE_PRIORITY_IGNORED));
     }
-    // The wanted file goes back to Normal, since a previous resolve for another
-    // file in the same torrent may have turned it off.
-    requests.push((wanted.to_string(), FILE_PRIORITY_NORMAL));
+    let kept = ids(true);
+    if !kept.is_empty() {
+        requests.push((kept, FILE_PRIORITY_NORMAL));
+    }
     requests
 }
 
-/// Deselect every file but `wanted`; qBittorrent splits the `id` list on `|`.
+/// Turn off every file that no request is waiting on.
 async fn qb_select_only_file(
     http: &Client,
     cfg: &QbConfig,
     session_cookie: &str,
     info_hash: &str,
+    redis: &RedisClient,
     files: &[QbFile],
     wanted: usize,
 ) -> Result<(), ProviderError> {
-    for (ids, priority) in file_prio_requests(files.len(), wanted) {
+    let requested = requested_files(redis, info_hash, wanted).await;
+    for (ids, priority) in file_prio_requests(files, &requested) {
         qb_file_prio(http, cfg, session_cookie, info_hash, &ids, priority).await?;
     }
     Ok(())
@@ -307,31 +354,76 @@ async fn qb_wait_for_files(
     }
 }
 
-/// Wait for the one file we selected, not the torrent as a whole: a season pack
-/// reports its progress as the average over every file, so the torrent can read
-/// as done while the episode we want has barely started.
-async fn qb_wait_for_file(
+/// Wait until the picked file is at the configured progress and on disk under
+/// any of the configured WebDAV roots.
+///
+/// All roots are polled together, so a file that lives outside the primary root
+/// does not spend the whole budget against the wrong path, and a wrong path
+/// cannot trigger the recheck below while the data is actually present.
+async fn qb_wait_until_playable(
     http: &Client,
     cfg: &QbConfig,
     session_cookie: &str,
     info_hash: &str,
     wanted: usize,
-) -> Result<(), ProviderError> {
+    hrefs: &[String],
+) -> Result<String, ProviderError> {
     let threshold = cfg.play_video_after as f64 / 100.0;
     let deadline = Instant::now() + Duration::from_secs(cfg.download_wait_timeout_secs);
     let mut last_progress = 0.0f64;
+    let mut rechecked = false;
 
     loop {
         if let Ok(files) = qb_torrent_files(http, cfg, session_cookie, info_hash).await
-            && let Some(f) = files.get(wanted)
+            && let Some(f) = files.iter().find(|f| f.index == wanted)
         {
             last_progress = f.progress;
-            if last_progress >= threshold {
-                return Ok(());
+            if f.progress >= threshold {
+                for href in hrefs {
+                    if webdav::exists(
+                        http,
+                        &cfg.webdav_url,
+                        href,
+                        &cfg.webdav_user,
+                        &cfg.webdav_pass,
+                    )
+                    .await
+                    {
+                        return Ok(href.clone());
+                    }
+                }
+            }
+            if f.progress >= threshold && !rechecked {
+                tracing::debug!(
+                    info_hash = %info_hash,
+                    "qBittorrent calls the file complete but WebDAV does not have it; rechecking"
+                );
+                // A failed recheck must not end the wait: the request can fail
+                // transiently and the file can still appear before the deadline.
+                // Retried on the next poll, like qb_ensure_running below.
+                match qb_post(
+                    http,
+                    cfg,
+                    session_cookie,
+                    "/api/v2/torrents/recheck",
+                    info_hash,
+                )
+                .await
+                {
+                    Ok(()) => rechecked = true,
+                    Err(e) => {
+                        tracing::debug!(info_hash = %info_hash, error = %e, "recheck request failed")
+                    }
+                }
             }
         }
+
         if Instant::now() >= deadline {
             break;
+        }
+        // A stopped or paused torrent never advances, so keep nudging it.
+        if let Ok(Some(status)) = qb_torrent_info(http, cfg, session_cookie, info_hash).await {
+            let _ = qb_ensure_running(http, cfg, session_cookie, info_hash, &status).await;
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
@@ -354,12 +446,36 @@ async fn qb_wait_for_file(
     ))
 }
 
+async fn qb_post(
+    http: &Client,
+    cfg: &QbConfig,
+    session_cookie: &str,
+    endpoint: &str,
+    info_hash: &str,
+) -> Result<(), ProviderError> {
+    let url = format!("{}{endpoint}", cfg.qb_url);
+    let resp = http
+        .post(&url)
+        .header(COOKIE, session_cookie)
+        .form(&[("hashes", info_hash)])
+        .send()
+        .await?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    let text = resp.text().await.unwrap_or_default().to_lowercase();
+    Err(ProviderError::api(
+        format!("qBittorrent {endpoint} failed: {text}"),
+        "torrent_not_downloaded.mp4",
+    ))
+}
+
 async fn qb_torrent_info(
     http: &Client,
     cfg: &QbConfig,
     session_cookie: &str,
     info_hash: &str,
-) -> Result<Option<f64>, ProviderError> {
+) -> Result<Option<QbTorrent>, ProviderError> {
     let url = format!("{}/api/v2/torrents/info?hashes={info_hash}", cfg.qb_url);
     let arr: Vec<Value> = http
         .get(&url)
@@ -368,9 +484,49 @@ async fn qb_torrent_info(
         .await?
         .json()
         .await?;
-    Ok(arr
-        .first()
-        .and_then(|t| t.get("progress").and_then(|v| v.as_f64())))
+    Ok(arr.first().map(|t| QbTorrent {
+        state: t
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    }))
+}
+
+/// Restart a torrent that was stopped, paused, or lost its data.
+async fn qb_ensure_running(
+    http: &Client,
+    cfg: &QbConfig,
+    session_cookie: &str,
+    info_hash: &str,
+    status: &QbTorrent,
+) -> Result<(), ProviderError> {
+    let (endpoint, matches_state) = match status.state.as_str() {
+        "stopped" | "paused" | "pausedDL" | "pausedUP" => ("/api/v2/torrents/start", true),
+        "missingFiles" => ("/api/v2/torrents/recheck", true),
+        "error" => ("/api/v2/torrents/recheck", true),
+        _ => return Ok(()),
+    };
+    if !matches_state {
+        return Ok(());
+    }
+
+    tracing::debug!(info_hash = %info_hash, state = %status.state, "restarting torrent");
+    let url = format!("{}{endpoint}", cfg.qb_url);
+    let resp = http
+        .post(&url)
+        .header(COOKIE, session_cookie)
+        .form(&[("hashes", info_hash)])
+        .send()
+        .await?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    let text = resp.text().await.unwrap_or_default().to_lowercase();
+    Err(ProviderError::api(
+        format!("qBittorrent could not restart the torrent: {text}"),
+        "torrent_not_downloaded.mp4",
+    ))
 }
 
 async fn qb_add_torrent(
@@ -600,6 +756,7 @@ async fn find_file(
     cfg: &QbConfig,
     session_cookie: &str,
     info_hash: &str,
+    redis: &RedisClient,
     torrent_name: &str,
     filename: Option<&str>,
     season: Option<i32>,
@@ -608,30 +765,37 @@ async fn find_file(
     let qb_files = qb_wait_for_files(http, cfg, session_cookie, info_hash).await;
     if let Some(qb_files) = qb_files {
         let files = file_entries_of(&qb_files);
-        if let Ok(idx) =
+        if let Ok(index) =
             select_torrent_file_index(&files, torrent_name, filename, season, episode, None, None)
         {
-            qb_select_only_file(http, cfg, session_cookie, info_hash, &qb_files, idx).await?;
-            qb_wait_for_file(http, cfg, session_cookie, info_hash, idx).await?;
+            // Selection reports qBittorrent's file index, which is not a position
+            // in the list, so resolve the entry rather than subscripting it.
+            let Some(file) = qb_files.iter().find(|f| f.index == index) else {
+                return Err(ProviderError::api(
+                    "The selected file is not in the torrent's file list",
+                    "no_matching_file.mp4",
+                ));
+            };
+            qb_select_only_file(
+                http,
+                cfg,
+                session_cookie,
+                info_hash,
+                redis,
+                &qb_files,
+                index,
+            )
+            .await?;
 
-            for root in &cfg.downloads_paths {
-                let href = torrent_file_href(root, info_hash, &files[idx].name);
-                if webdav::exists(
-                    http,
-                    &cfg.webdav_url,
-                    &href,
-                    &cfg.webdav_user,
-                    &cfg.webdav_pass,
-                )
-                .await
-                {
-                    return Ok(href);
-                }
-            }
-            return Err(ProviderError::api(
-                "The selected file is not on disk yet",
-                "torrent_not_downloaded.mp4",
-            ));
+            let hrefs: Vec<String> = cfg
+                .downloads_paths
+                .iter()
+                .map(|root| torrent_file_href(root, info_hash, &file.name))
+                .collect();
+            // Pass the wait's own error on: it names the progress reached and any
+            // failure to recheck, both of which a generic message would hide.
+            return qb_wait_until_playable(http, cfg, session_cookie, info_hash, index, &hrefs)
+                .await;
         }
     }
 
@@ -670,6 +834,7 @@ pub async fn get_video_url(
     http: &Client,
     config: &Value,
     info_hash: &str,
+    redis: &RedisClient,
     magnet_link: &str,
     torrent_name: &str,
     filename: Option<&str>,
@@ -681,8 +846,11 @@ pub async fn get_video_url(
     let cfg = parse_config(config)?;
     let session_cookie = qb_login(http, &cfg).await?;
 
-    let existing_progress = qb_torrent_info(http, &cfg, &session_cookie, info_hash).await?;
-    if existing_progress.is_none() {
+    let existing = qb_torrent_info(http, &cfg, &session_cookie, info_hash).await?;
+    if let Some(status) = existing.as_ref() {
+        qb_ensure_running(http, &cfg, &session_cookie, info_hash, status).await?;
+    }
+    if existing.is_none() {
         qb_add_torrent(
             http,
             &cfg,
@@ -701,6 +869,7 @@ pub async fn get_video_url(
         &cfg,
         &session_cookie,
         info_hash,
+        redis,
         torrent_name,
         filename,
         season,
@@ -710,7 +879,7 @@ pub async fn get_video_url(
     {
         Ok(p) => p,
         Err(e) => {
-            if existing_progress.is_some() {
+            if existing.is_some() {
                 return Err(e);
             }
             qb_add_magnet(http, &cfg, &session_cookie, magnet_link, info_hash).await?;
@@ -719,6 +888,7 @@ pub async fn get_video_url(
                 &cfg,
                 &session_cookie,
                 info_hash,
+                redis,
                 torrent_name,
                 filename,
                 season,
@@ -838,23 +1008,52 @@ mod tests {
         torrent_file_href,
     };
 
+    fn qbf(index: usize, name: &str) -> QbFile {
+        QbFile {
+            index,
+            name: name.into(),
+            size: 1,
+            progress: 0.0,
+        }
+    }
+
     #[test]
-    fn the_wanted_file_is_turned_back_on() {
-        // Playing S01E03 turns every other file off; a later request for S01E04
-        // has to turn S01E04 back on or qBittorrent never downloads it and the
-        // wait times out.
+    fn file_priorities_are_addressed_by_qbittorrent_index() {
+        // qBittorrent addresses files by the `index` it reports, which is not
+        // necessarily the position it returned them in.
+        let files = vec![qbf(2, "c.mkv"), qbf(0, "a.mkv"), qbf(5, "b.mkv")];
         assert_eq!(
-            file_prio_requests(4, 2),
+            file_prio_requests(&files, &[0]),
             vec![
-                ("0|1|3".to_string(), FILE_PRIORITY_IGNORED),
-                ("2".to_string(), FILE_PRIORITY_NORMAL),
+                ("2|5".to_string(), FILE_PRIORITY_IGNORED),
+                ("0".to_string(), FILE_PRIORITY_NORMAL),
             ]
         );
+
         // Even a single-file torrent has to be asked for, since a previous
         // resolve for a different file in the same torrent may have turned it off.
         assert_eq!(
-            file_prio_requests(1, 0),
-            vec![("0".to_string(), FILE_PRIORITY_NORMAL)]
+            file_prio_requests(&[qbf(3, "a.mkv")], &[3]),
+            vec![("3".to_string(), FILE_PRIORITY_NORMAL)]
+        );
+    }
+
+    #[test]
+    fn files_another_request_is_waiting_on_stay_enabled() {
+        // Two playbacks of different episodes of one torrent must not turn each
+        // other off: only files no request is waiting on are deselected.
+        let files = vec![
+            qbf(0, "E01.mkv"),
+            qbf(1, "E02.mkv"),
+            qbf(2, "E03.mkv"),
+            qbf(3, "E04.mkv"),
+        ];
+        assert_eq!(
+            file_prio_requests(&files, &[2, 3]),
+            vec![
+                ("0|1".to_string(), FILE_PRIORITY_IGNORED),
+                ("2|3".to_string(), FILE_PRIORITY_NORMAL),
+            ]
         );
     }
 
@@ -921,10 +1120,13 @@ mod tests {
         .expect("S01E03 should be selectable");
 
         assert_eq!(idx, 2);
-        assert_eq!(
-            qb_files[idx].name,
-            format!("{dir}/Some Show S01E03 Third.mkv")
-        );
+        // Selection reports the file's qBittorrent index, so resolve the entry
+        // the way the provider does rather than subscripting the list.
+        let picked = qb_files
+            .iter()
+            .find(|f| f.index == idx)
+            .expect("the selected index is one of the torrent's files");
+        assert_eq!(picked.name, format!("{dir}/Some Show S01E03 Third.mkv"));
     }
 
     #[test]
