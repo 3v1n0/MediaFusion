@@ -16,6 +16,7 @@ export interface QBittorrentConfigType {
   stl: number // seeding_time_limit
   srl: number // seeding_ratio_limit
   pva: number // play_video_after
+  flpp?: boolean // first_last_piece_prio, head/tail of the file first
   dwt?: number // download_wait_timeout
   cat: string // category
   wur: string // webdav_url
@@ -453,6 +454,7 @@ function mapQBittorrentConfig(config?: QBittorrentConfigType): QBittorrentConfig
     seeding_ratio_limit: config.srl,
     play_video_after: config.pva,
     ...(config.dwt ? { download_wait_timeout: config.dwt } : {}),
+    ...(config.flpp === false ? { first_last_piece_prio: false } : {}),
     category: config.cat,
     webdav_url: config.wur,
     webdav_username: config.wus,

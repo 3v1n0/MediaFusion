@@ -892,6 +892,22 @@ function SingleProviderEditor({
                   </div>
 
                   <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label htmlFor="qb-flpp">Prioritize first and last pieces</Label>
+                      <Switch
+                        id="qb-flpp"
+                        checked={provider.qbc?.flpp !== false}
+                        onCheckedChange={(checked) => updateQBConfig({ flpp: checked })}
+                      />
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Asks qBittorrent to fetch the head and tail of the file first, so playback can start long before
+                      the rest of it arrives. On by default; only worth turning off if you always wait for the whole
+                      file.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
                     <Label>Download wait timeout (seconds)</Label>
                     <Input
                       type="number"

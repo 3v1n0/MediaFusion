@@ -35,6 +35,9 @@ struct QbConfig {
     play_video_after: i32,
     /// How long to wait for a torrent to reach `play_video_after`, in seconds.
     download_wait_timeout_secs: u64,
+    /// Ask qBittorrent for the head and tail of the file first, so playback can
+    /// start long before the rest of it arrives.
+    first_last_piece_prio: bool,
     seeding_time_limit: i32,
     seeding_ratio_limit: f64,
     category: String,
@@ -89,6 +92,11 @@ fn parse_config(raw: &Value) -> Result<QbConfig, ProviderError> {
         .and_then(|v| v.as_i64())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS) as u64;
+    let first_last_piece_prio = raw
+        .get("first_last_piece_prio")
+        .or_else(|| raw.get("flpp"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let seeding_time_limit = raw
         .get("seeding_time_limit")
         .or_else(|| raw.get("stl"))
@@ -111,6 +119,7 @@ fn parse_config(raw: &Value) -> Result<QbConfig, ProviderError> {
         downloads_paths,
         play_video_after,
         download_wait_timeout_secs,
+        first_last_piece_prio,
         seeding_time_limit,
         seeding_ratio_limit,
         category,
@@ -507,6 +516,14 @@ async fn qb_add_torrent(
                     .part("torrents", part)
                     .text("savepath", info_hash.to_string())
                     .text("sequentialDownload", "true")
+                    .text(
+                        "firstLastPiecePrio",
+                        if cfg.first_last_piece_prio {
+                            "true"
+                        } else {
+                            "false"
+                        },
+                    )
                     .text("category", cfg.category.clone())
                     .text("seedingTimeLimit", cfg.seeding_time_limit.to_string())
                     .text("ratioLimit", cfg.seeding_ratio_limit.to_string()),
@@ -520,6 +537,14 @@ async fn qb_add_torrent(
                 ("urls", magnet),
                 ("savepath", info_hash),
                 ("sequentialDownload", "true"),
+                (
+                    "firstLastPiecePrio",
+                    if cfg.first_last_piece_prio {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
                 ("category", &cfg.category),
                 ("seedingTimeLimit", &cfg.seeding_time_limit.to_string()),
                 ("ratioLimit", &cfg.seeding_ratio_limit.to_string()),
@@ -1039,6 +1064,28 @@ mod tests {
         let idx = select_torrent_file_index(&files, "Show", None, Some(1), Some(3), None, None)
             .expect("S01E03 should be selectable");
         assert_eq!(files[idx].name, "Show.S01E03.mkv");
+    }
+
+    #[test]
+    fn first_last_piece_prio_is_on_by_default_for_streaming() {
+        // qBittorrent defaults this to false when the parameter is absent, so
+        // omitting it silently disabled the head-of-file-first behaviour.
+        let cfg = parse_config(&json!({
+            "qbittorrent_url": "http://qb:8080",
+            "webdav_url": "http://dav/webdav",
+        }))
+        .unwrap();
+        assert!(cfg.first_last_piece_prio);
+
+        for key in ["first_last_piece_prio", "flpp"] {
+            let cfg = parse_config(&json!({
+                "qbittorrent_url": "http://qb:8080",
+                "webdav_url": "http://dav/webdav",
+                key: false,
+            }))
+            .unwrap();
+            assert!(!cfg.first_last_piece_prio, "{key} should be read");
+        }
     }
 
     #[test]

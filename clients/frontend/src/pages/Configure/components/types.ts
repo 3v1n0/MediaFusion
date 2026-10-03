@@ -13,6 +13,7 @@ export interface QBittorrentConfig {
   srl: number // seeding_ratio_limit
   pva: number // play_video_after
   dwt?: number // download_wait_timeout, seconds to wait for that percentage
+  flpp?: boolean // first_last_piece_prio, fetch head/tail of the file first. Defaults on.
   cat: string // category
   wur: string // webdav_url
   wus: string // webdav_username
