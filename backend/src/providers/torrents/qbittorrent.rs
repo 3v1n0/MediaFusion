@@ -34,6 +34,7 @@ struct QbConfig {
     downloads_paths: Vec<String>,
     play_video_after: i32,
     download_wait_timeout_secs: u64,
+    first_last_piece_prio: bool,
     seeding_time_limit: i32,
     seeding_ratio_limit: f64,
     category: String,
@@ -88,6 +89,11 @@ fn parse_config(raw: &Value) -> Result<QbConfig, ProviderError> {
         .and_then(|v| v.as_i64())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS) as u64;
+    let first_last_piece_prio = raw
+        .get("first_last_piece_prio")
+        .or_else(|| raw.get("flpp"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let seeding_time_limit = raw
         .get("seeding_time_limit")
         .or_else(|| raw.get("stl"))
@@ -110,6 +116,7 @@ fn parse_config(raw: &Value) -> Result<QbConfig, ProviderError> {
         downloads_paths,
         play_video_after,
         download_wait_timeout_secs,
+        first_last_piece_prio,
         seeding_time_limit,
         seeding_ratio_limit,
         category,
@@ -173,6 +180,7 @@ struct QbFile {
 
 struct QbTorrent {
     state: String,
+    first_last_piece_prio: bool,
 }
 
 async fn qb_torrent_files(
@@ -484,13 +492,21 @@ async fn qb_torrent_info(
         .await?
         .json()
         .await?;
-    Ok(arr.first().map(|t| QbTorrent {
-        state: t
+    Ok(arr.first().and_then(qb_torrent_from_json))
+}
+
+fn qb_torrent_from_json(row: &Value) -> Option<QbTorrent> {
+    Some(QbTorrent {
+        state: row
             .get("state")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
-    }))
+        first_last_piece_prio: row
+            .get("f_l_piece_prio")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
 }
 
 /// Restart a torrent that was stopped, paused, or lost its data.
@@ -501,32 +517,43 @@ async fn qb_ensure_running(
     info_hash: &str,
     status: &QbTorrent,
 ) -> Result<(), ProviderError> {
-    let (endpoint, matches_state) = match status.state.as_str() {
-        "stopped" | "paused" | "pausedDL" | "pausedUP" => ("/api/v2/torrents/start", true),
-        "missingFiles" => ("/api/v2/torrents/recheck", true),
-        "error" => ("/api/v2/torrents/recheck", true),
+    let endpoint = match status.state.as_str() {
+        "stopped" | "paused" | "pausedDL" | "pausedUP" => "/api/v2/torrents/start",
+        "missingFiles" | "error" => "/api/v2/torrents/recheck",
         _ => return Ok(()),
     };
-    if !matches_state {
+
+    tracing::debug!(info_hash = %info_hash, state = %status.state, "restarting torrent");
+    qb_post(http, cfg, session_cookie, endpoint, info_hash).await
+}
+
+/// Set first/last piece priority when it disagrees with the profile. The API
+/// only offers a toggle, so the current value is read back first.
+async fn qb_ensure_piece_priority(
+    http: &Client,
+    cfg: &QbConfig,
+    session_cookie: &str,
+    info_hash: &str,
+    status: &QbTorrent,
+) -> Result<(), ProviderError> {
+    if status.first_last_piece_prio == cfg.first_last_piece_prio {
         return Ok(());
     }
 
-    tracing::debug!(info_hash = %info_hash, state = %status.state, "restarting torrent");
-    let url = format!("{}{endpoint}", cfg.qb_url);
-    let resp = http
-        .post(&url)
-        .header(COOKIE, session_cookie)
-        .form(&[("hashes", info_hash)])
-        .send()
-        .await?;
-    if resp.status().is_success() {
-        return Ok(());
-    }
-    let text = resp.text().await.unwrap_or_default().to_lowercase();
-    Err(ProviderError::api(
-        format!("qBittorrent could not restart the torrent: {text}"),
-        "torrent_not_downloaded.mp4",
-    ))
+    tracing::debug!(
+        info_hash = %info_hash,
+        current = %status.first_last_piece_prio,
+        wanted = %cfg.first_last_piece_prio,
+        "toggling first/last piece priority"
+    );
+    qb_post(
+        http,
+        cfg,
+        session_cookie,
+        "/api/v2/torrents/toggleFirstLastPiecePrio",
+        info_hash,
+    )
+    .await
 }
 
 async fn qb_add_torrent(
@@ -558,6 +585,14 @@ async fn qb_add_torrent(
                     .part("torrents", part)
                     .text("savepath", info_hash.to_string())
                     .text("sequentialDownload", "true")
+                    .text(
+                        "firstLastPiecePrio",
+                        if cfg.first_last_piece_prio {
+                            "true"
+                        } else {
+                            "false"
+                        },
+                    )
                     .text("category", cfg.category.clone())
                     .text("seedingTimeLimit", cfg.seeding_time_limit.to_string())
                     .text("ratioLimit", cfg.seeding_ratio_limit.to_string()),
@@ -571,6 +606,14 @@ async fn qb_add_torrent(
                 ("urls", magnet),
                 ("savepath", info_hash),
                 ("sequentialDownload", "true"),
+                (
+                    "firstLastPiecePrio",
+                    if cfg.first_last_piece_prio {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
                 ("category", &cfg.category),
                 ("seedingTimeLimit", &cfg.seeding_time_limit.to_string()),
                 ("ratioLimit", &cfg.seeding_ratio_limit.to_string()),
@@ -849,6 +892,7 @@ pub async fn get_video_url(
     let existing = qb_torrent_info(http, &cfg, &session_cookie, info_hash).await?;
     if let Some(status) = existing.as_ref() {
         qb_ensure_running(http, &cfg, &session_cookie, info_hash, status).await?;
+        qb_ensure_piece_priority(http, &cfg, &session_cookie, info_hash, status).await?;
     }
     if existing.is_none() {
         qb_add_torrent(
@@ -1004,8 +1048,8 @@ mod tests {
     use super::{
         DEFAULT_DOWNLOAD_WAIT_TIMEOUT_SECS, FILE_PRIORITY_IGNORED, FILE_PRIORITY_NORMAL, Href,
         QbFile, classify_href, encode_path_segments, file_entries_of, file_prio_requests,
-        parse_config, qb_files_from_json, select_torrent_file_index, session_cookie,
-        torrent_file_href,
+        parse_config, qb_files_from_json, qb_torrent_from_json, select_torrent_file_index,
+        session_cookie, torrent_file_href,
     };
 
     fn qbf(index: usize, name: &str) -> QbFile {
@@ -1152,6 +1196,50 @@ mod tests {
         let idx = select_torrent_file_index(&files, "Show", None, Some(1), Some(3), None, None)
             .expect("S01E03 should be selectable");
         assert_eq!(files[idx].name, "Show.S01E03.mkv");
+    }
+
+    #[test]
+    fn reads_state_and_first_last_prio_off_a_torrents_info_row() {
+        let row = json!({
+            "hash": "abc",
+            "name": "Show.S01E01.mkv",
+            "state": "downloading",
+            "seq_dl": true,
+            "f_l_piece_prio": true,
+            "category": "MediaFusion",
+            "amount_left": 0,
+        });
+        let t = qb_torrent_from_json(&row).unwrap();
+        assert_eq!(t.state, "downloading");
+        assert!(t.first_last_piece_prio);
+
+        let row_off = json!({"state": "pausedDL", "seq_dl": true, "f_l_piece_prio": false});
+        let t = qb_torrent_from_json(&row_off).unwrap();
+        assert_eq!(t.state, "pausedDL");
+        assert!(!t.first_last_piece_prio);
+
+        let legacy = json!({"state": "stalledDL"});
+        assert!(!qb_torrent_from_json(&legacy).unwrap().first_last_piece_prio);
+    }
+
+    #[test]
+    fn first_last_piece_prio_is_on_by_default_for_streaming() {
+        let cfg = parse_config(&json!({
+            "qbittorrent_url": "http://qb:8080",
+            "webdav_url": "http://dav/webdav",
+        }))
+        .unwrap();
+        assert!(cfg.first_last_piece_prio);
+
+        for key in ["first_last_piece_prio", "flpp"] {
+            let cfg = parse_config(&json!({
+                "qbittorrent_url": "http://qb:8080",
+                "webdav_url": "http://dav/webdav",
+                key: false,
+            }))
+            .unwrap();
+            assert!(!cfg.first_last_piece_prio, "{key} should be read");
+        }
     }
 
     #[test]
